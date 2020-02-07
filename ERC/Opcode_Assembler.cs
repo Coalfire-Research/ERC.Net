@@ -54,8 +54,10 @@ namespace ERC.Utilities
                 result.Error = e;
                 result.LogEvent();
                 asm.Dispose();
+                GC.Collect();
                 return result;
             }
+            GC.Collect();
             return result;
         }
 
@@ -96,8 +98,10 @@ namespace ERC.Utilities
                 result.Error = e;
                 result.LogEvent();
                 asm.Dispose();
+                GC.Collect();
                 return result;
             }
+            GC.Collect();
             return result;
         }
     }

@@ -1,15 +1,18 @@
 ﻿using ERC.Structures;
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace ERC
 {
-    /// <summary> Contains information needed for the associated functions relating the process. </summary>
+    /// <summary> Contains information needed for the associated functions relating to the process. </summary>
     public class ProcessInfo : ErcCore
     {
         #region Class_Variables
@@ -35,8 +38,8 @@ namespace ERC
         public List<ThreadInfo> ThreadsInfo = new List<ThreadInfo>();
 
         internal ErcCore ProcessCore;
-        private List<MEMORY_BASIC_INFORMATION32> ProcessMemoryBasicInfo32;
-        private List<MEMORY_BASIC_INFORMATION64> ProcessMemoryBasicInfo64;
+        internal List<MEMORY_BASIC_INFORMATION32> ProcessMemoryBasicInfo32;
+        internal List<MEMORY_BASIC_INFORMATION64> ProcessMemoryBasicInfo64;
 
         private const uint LIST_MODULES_ALL = 0x03;
         #endregion
@@ -95,6 +98,67 @@ namespace ERC
         }
 
         /// <summary>
+        /// Constructor for the Process_Info object, requires an ERC_Core object and a Process.
+        /// </summary>
+        /// <param name="core">An ErcCore object</param>
+        /// <param name="handle">The handle for the process to gather information from</param>
+        public ProcessInfo(ErcCore core, IntPtr handle) : base(core)
+        {
+            uint flags = 0;
+            bool result = GetHandleInformation(handle, out flags);
+            if(result == false)
+            {
+                throw new ERCException("The handle provided is not a valid process (GetHandleInformation returned false)");
+            }
+            uint processID = GetProcessId(handle);
+            
+            Process process = Process.GetProcessById((int)processID);
+            ProcessCore = core;
+
+            if (Is64Bit(process))
+            {
+                ProcessMachineType = MachineType.x64;
+            }
+            else
+            {
+                ProcessMachineType = MachineType.I386;
+            }
+
+            ProcessName = process.ProcessName;
+            ProcessDescription = FileVersionInfo.GetVersionInfo(process.MainModule.FileName).FileDescription;
+            ProcessPath = FileVersionInfo.GetVersionInfo(process.MainModule.FileName).FileName;
+            ProcessID = process.Id;
+            ProcessCurrent = process;
+            ProcessHandle = process.Handle;
+            ProcessModuleHandles = GetProcessModules().ReturnValue;
+
+            if (ProcessModuleHandles.Count == 0)
+            {
+                for (int i = 0; i < process.Modules.Count; i++)
+                {
+                    ProcessModuleHandles.Add(process.Modules[i].FileName, process.Modules[i].BaseAddress);
+                }
+            }
+            foreach (KeyValuePair<string, IntPtr> s in ProcessModuleHandles)
+            {
+                ModuleInfo thisModuleInfo = new ModuleInfo(s.Key, s.Value, process, core);
+                if (thisModuleInfo.ModuleFailed == false)
+                {
+                    ModulesInfo.Add(thisModuleInfo);
+                }
+            }
+            for (int i = 0; i < process.Threads.Count; i++)
+            {
+                ThreadInfo thisThreadInfo = new ThreadInfo(process.Threads[i], ProcessCore, this);
+                if (thisThreadInfo.ThreadFailed == false)
+                {
+                    ThreadsInfo.Add(thisThreadInfo);
+                }
+            }
+            LocateMemoryRegions();
+        }
+
+        /// <summary>
         /// Constructor to use when inheriting from ProcessInfo.
         /// </summary>
         /// <param name="parent">The object to inherit from</param>
@@ -139,7 +203,7 @@ namespace ERC
                 {
                     filename = processes[i].MainModule.FileName;
                 }
-                catch(Exception e)
+                catch(Exception)
                 {
                     processesToRemove.Add(i);
                 }
@@ -156,6 +220,56 @@ namespace ERC
                 }
             }
             
+            result.ReturnValue = usableProcesses;
+            return result;
+        }
+        #endregion
+
+        #region ListRemoteProcesses
+        /// <summary>
+        /// Gets a list of running processes on the host and removes unusable processes.
+        /// </summary>
+        /// <param name="core">An ErcCore object</param>
+        /// <param name="machineName">The computer from which to read the list of processes. Can be either the hostname or IP address.</param>
+        /// <returns>Returns an ErcResult containing a list of all supported processes</returns>
+        public static ErcResult<Process[]> ListRemoteProcesses(ErcCore core, string machineName)
+        {
+            ErcResult<Process[]> result = new ErcResult<Process[]>(core);
+
+            IPAddress machine = null;
+            if(IPAddress.TryParse(machineName, out machine))
+            {
+                IPHostEntry hostEntry = Dns.GetHostEntry(machine);
+                machineName = hostEntry.HostName;
+            }
+            
+            Process[] processes = Process.GetProcesses(machineName);
+            List<int> processesToRemove = new List<int>();
+
+            for (int i = 0; i < processes.Length; i++)
+            {
+                string filename = null;
+                try
+                {
+                    filename = processes[i].MainModule.FileName;
+                }
+                catch (Exception)
+                {
+                    processesToRemove.Add(i);
+                }
+            }
+
+            Process[] usableProcesses = new Process[processes.Length - processesToRemove.Count];
+            int processCounter = 0;
+            for (int i = 0; i < processes.Length; i++)
+            {
+                if (!processesToRemove.Contains(i))
+                {
+                    usableProcesses[processCounter] = processes[i];
+                    processCounter++;
+                }
+            }
+
             result.ReturnValue = usableProcesses;
             return result;
         }
@@ -226,6 +340,11 @@ namespace ERC
         public static bool Is64Bit(Process process)
         {
             bool isWow64;
+
+            if(process == null)
+            {
+                throw new ERCException("No process attached.");
+            }
 
             if (!Environment.Is64BitOperatingSystem)
             {
@@ -594,7 +713,7 @@ namespace ERC
                 }
             }
             resultAddresses.ReturnValue = new HashSet<IntPtr>(resultAddresses.ReturnValue).ToList();
-            resultAddresses.ReturnValue = Utilities.PtrRemover.RemovePointers(resultAddresses.ReturnValue, ptrsToExclude);
+            resultAddresses.ReturnValue = Utilities.PtrRemover.RemovePointers(ProcessMachineType, resultAddresses.ReturnValue, ptrsToExclude);
             return resultAddresses;
         }
         #endregion
@@ -892,12 +1011,12 @@ namespace ERC
                     }
                 }
             }
-            ptrs.ReturnValue = Utilities.PtrRemover.RemovePointers(ptrs.ReturnValue, ptrsToExclude);
+            ptrs.ReturnValue = Utilities.PtrRemover.RemovePointers(ProcessMachineType, ptrs.ReturnValue, ptrsToExclude);
             return ptrs;
         }
         #endregion
 
-        #region Search_Memory
+        #region SearchMemory
         /// <summary>
         /// Searches all memory (the process and associated DLLs) for a specific string or byte array. Strings can be passed as ASCII, Unicode, UTF7 or UTF8.
         /// Specific modules can be exclude through passing a Listof strings containing module names or paths.
@@ -1080,7 +1199,7 @@ namespace ERC
                     }
                 }
             }
-            resultAddresses.ReturnValue = Utilities.PtrRemover.RemovePointers(resultAddresses.ReturnValue, ptrsToExclude);
+            resultAddresses.ReturnValue = Utilities.PtrRemover.RemovePointers(ProcessMachineType, resultAddresses.ReturnValue, ptrsToExclude);
             return resultAddresses;
         }
         #endregion
@@ -1143,45 +1262,62 @@ namespace ERC
                     regEdi.Register = "EDI";
                     regEdi.RegisterValue = (IntPtr)ThreadsInfo[i].Context32.Edi;
                     regEdi.ThreadID = ThreadsInfo[i].ThreadID;
+                    regEdi.StringOffset = -1;
+                    regEdi.RegisterOffset = -1;
                     registers.Add(regEdi);
                     RegisterInfo regEsi = new RegisterInfo();
                     regEsi.Register = "ESI";
                     regEsi.RegisterValue = (IntPtr)ThreadsInfo[i].Context32.Esi;
                     regEsi.ThreadID = ThreadsInfo[i].ThreadID;
+                    regEsi.StringOffset = -1;
+                    regEsi.RegisterOffset = -1;
                     registers.Add(regEsi);
                     RegisterInfo regEbx = new RegisterInfo();
                     regEbx.Register = "EBX";
                     regEbx.RegisterValue = (IntPtr)ThreadsInfo[i].Context32.Ebx;
                     regEbx.ThreadID = ThreadsInfo[i].ThreadID;
+                    regEbx.StringOffset = -1;
+                    regEbx.RegisterOffset = -1;
                     registers.Add(regEbx);
                     RegisterInfo regEdx = new RegisterInfo();
                     regEdx.Register = "EDX";
                     regEdx.RegisterValue = (IntPtr)ThreadsInfo[i].Context32.Edx;
                     regEdx.ThreadID = ThreadsInfo[i].ThreadID;
+                    regEdx.StringOffset = -1;
+                    regEdx.RegisterOffset = -1;
                     registers.Add(regEdx);
                     RegisterInfo regEcx = new RegisterInfo();
                     regEcx.Register = "ECX";
                     regEcx.RegisterValue = (IntPtr)ThreadsInfo[i].Context32.Ecx;
                     regEcx.ThreadID = ThreadsInfo[i].ThreadID;
+                    regEcx.StringOffset = -1;
+                    regEcx.RegisterOffset = -1;
                     registers.Add(regEcx);
                     RegisterInfo regEax = new RegisterInfo();
                     regEax.Register = "EAX";
                     regEax.RegisterValue = (IntPtr)ThreadsInfo[i].Context32.Eax;
                     regEax.ThreadID = ThreadsInfo[i].ThreadID;
+                    regEax.StringOffset = -1;
+                    regEax.RegisterOffset = -1;
                     registers.Add(regEax);
                     RegisterInfo regEsp = new RegisterInfo();
                     regEsp.Register = "ESP";
                     regEsp.RegisterValue = (IntPtr)ThreadsInfo[i].Context32.Esp;
                     regEsp.ThreadID = ThreadsInfo[i].ThreadID;
+                    regEsp.StringOffset = -1;
+                    regEsp.RegisterOffset = -1;
                     registers.Add(regEsp);
                     RegisterInfo regEbp = new RegisterInfo();
                     regEbp.Register = "EBP";
                     regEbp.RegisterValue = (IntPtr)ThreadsInfo[i].Context32.Ebp;
                     regEbp.ThreadID = ThreadsInfo[i].ThreadID;
+                    regEbp.StringOffset = -1;
+                    regEbp.RegisterOffset = -1;
                     registers.Add(regEbp);
                     RegisterInfo regEIP = new RegisterInfo();
                     regEIP.Register = "EIP";
                     regEIP.RegisterValue = (IntPtr)ThreadsInfo[i].Context32.Eip;
+                    regEIP.ThreadID = ThreadsInfo[i].ThreadID;
                     registers.Add(regEIP);
                 }
 
@@ -1193,7 +1329,7 @@ namespace ERC
                         ulong regionEnd = (ulong)ProcessMemoryBasicInfo32[j].BaseAddress + (ulong)ProcessMemoryBasicInfo32[j].RegionSize;
 
                         if (registers[i].Register != "EIP" && registers[i].Register != "EBP" &&
-                            (ulong)registers[i].RegisterValue > regionStart && 
+                            (ulong)registers[i].RegisterValue > regionStart &&
                             (ulong)registers[i].RegisterValue < regionEnd)
                         {
                             ulong bufferSize = ((ulong)ProcessMemoryBasicInfo32[j].BaseAddress + (ulong)ProcessMemoryBasicInfo32[j].RegionSize) - (ulong)registers[i].RegisterValue;
@@ -1226,53 +1362,26 @@ namespace ERC
                                     memoryString = Encoding.Default.GetString(buffer);
                                     break;
                             }
-                            int length = 0;
-                            for(int k = 0; k < nrps.Count; k++)
+                            int length = -1;
+                            for (int k = 0; k < nrps.Count; k++)
                             {
-                                if (memoryString.Contains(nrps[k]))
+                                if (memoryString.Contains(nrps[k]) && pattern.Contains(nrps[k]))
                                 {
-                                    registers[i].StringOffset = pattern.IndexOf(nrps[k]);
+                                    if (registers[i].StringOffset == -1)
+                                    {
+                                        registers[i].StringOffset = pattern.IndexOf(nrps[k]);
+                                    }
 
-                                    //Check to see if previous characters match
                                     int index = memoryString.IndexOf(nrps[k]);
-                                    registers[i].RegisterOffset = index;
-                                    if (index >= 2)
+                                    if (registers[i].RegisterOffset == -1)
                                     {
-                                        char pos3 = memoryString[index - 1];
-                                        char pos2 = memoryString[index - 2];
-                                        char pos1 = memoryString[index - 3];
-                                        if (k > 0 && nrps[k - 1][2] == pos3)
-                                        {
-                                            registers[i].StringOffset--;
-                                            registers[i].RegisterOffset--;
-                                            if (nrps[k - 1][1] == pos2)
-                                            {
-                                                registers[i].StringOffset--;
-                                                registers[i].RegisterOffset--;
-                                                if (nrps[k - 1][0] == pos1)
-                                                {
-                                                    registers[i].StringOffset--;
-                                                    registers[i].RegisterOffset--;
-                                                }
-                                            }
-                                        }
+                                        registers[i].RegisterOffset = index;
                                     }
-                                    else if (index == 1)
-                                    {
-                                        char pos3 = memoryString[index - 1];
-                                        if (nrps[k - 1][2] == pos3 && k > 0)
-                                        {
-                                            registers[i].RegisterOffset--;
-                                        }
-                                    }
+                                    
                                     length += 3;
                                 }
-                                else
-                                {
-                                    k = nrps.Count;
-                                    registers[i].BufferSize = length;
-                                }
                             }
+                            registers[i].BufferSize = length;
                         }
                         else if (registers[i].Register == "EIP")
                         {
@@ -1305,6 +1414,19 @@ namespace ERC
                             if (pattern.Contains(EIPValue))
                             {
                                 registers[i].StringOffset = pattern.IndexOf(EIPValue);
+                            }
+                        }
+                    }
+                    if (Utilities.PatternTools.PatternOffset(Utilities.Convert.HexToAscii(registers[i].RegisterValue.ToString("X")), ProcessCore).ReturnValue != "Value not found in pattern.")
+                    {
+                        if(Utilities.Convert.HexToAscii(registers[i].RegisterValue.ToString("X")).Length > 0)
+                        {
+                            string regHex = Utilities.Convert.HexToAscii(registers[i].RegisterValue.ToString("X"));
+                            string regPos = Utilities.PatternTools.PatternOffset(Utilities.Convert.HexToAscii(registers[i].RegisterValue.ToString("X")), ProcessCore).ReturnValue;
+                            if (!String.IsNullOrEmpty(regPos) && regPos.Any(char.IsDigit))
+                            {
+                                registers[i].StringOffset = Int32.Parse(Regex.Match(regPos, @"\d+").Value);
+                                registers[i].overwritten = true;
                             }
                         }
                     }
@@ -1349,8 +1471,10 @@ namespace ERC
                                     char[] sehArray = SEHValue.ToCharArray();
                                     Array.Reverse(sehArray);
                                     SEHValue = new string(sehArray);
+                                    Array.Reverse(sehArray);
+                                    string ReversedSEHValue = new string(sehArray);
                                     RegisterInfo SEH = new RegisterInfo();
-                                    if (pattern.Contains(SEHValue))
+                                    if (pattern.Contains(SEHValue) || pattern.Contains(ReversedSEHValue));
                                     {
                                         SEH.Register = "SEH" + i.ToString();
                                         SEH.StringOffset = pattern.IndexOf(SEHValue);
@@ -1372,81 +1496,113 @@ namespace ERC
                     regRax.Register = "Rax";
                     regRax.RegisterValue = (IntPtr)ThreadsInfo[i].Context64.Rax;
                     regRax.ThreadID = ThreadsInfo[i].ThreadID;
+                    regRax.StringOffset = -1;
+                    regRax.RegisterOffset = -1;
                     registers.Add(regRax);
                     RegisterInfo regRbx = new RegisterInfo();
                     regRbx.Register = "RBX";
                     regRbx.RegisterValue = (IntPtr)ThreadsInfo[i].Context64.Rbx;
                     regRbx.ThreadID = ThreadsInfo[i].ThreadID;
+                    regRbx.StringOffset = -1;
+                    regRbx.RegisterOffset = -1;
                     registers.Add(regRbx);
                     RegisterInfo regRcx = new RegisterInfo();
                     regRcx.Register = "RCX";
                     regRcx.RegisterValue = (IntPtr)ThreadsInfo[i].Context64.Rcx;
                     regRcx.ThreadID = ThreadsInfo[i].ThreadID;
+                    regRcx.StringOffset = -1;
+                    regRcx.RegisterOffset = -1;
                     registers.Add(regRcx);
                     RegisterInfo regRdx = new RegisterInfo();
                     regRdx.Register = "RDX";
                     regRdx.RegisterValue = (IntPtr)ThreadsInfo[i].Context64.Rdx;
                     regRdx.ThreadID = ThreadsInfo[i].ThreadID;
+                    regRdx.StringOffset = -1;
+                    regRdx.RegisterOffset = -1;
                     registers.Add(regRdx);
                     RegisterInfo regRsp = new RegisterInfo();
                     regRsp.Register = "RSP";
                     regRsp.RegisterValue = (IntPtr)ThreadsInfo[i].Context64.Rsp;
                     regRsp.ThreadID = ThreadsInfo[i].ThreadID;
+                    regRsp.StringOffset = -1;
+                    regRsp.RegisterOffset = -1;
                     registers.Add(regRsp);
                     RegisterInfo regRbp = new RegisterInfo();
                     regRbp.Register = "RBP";
                     regRbp.RegisterValue = (IntPtr)ThreadsInfo[i].Context64.Rbp;
                     regRbp.ThreadID = ThreadsInfo[i].ThreadID;
+                    regRbp.StringOffset = -1;
+                    regRbp.RegisterOffset = -1;
                     registers.Add(regRbp);
                     RegisterInfo regRsi = new RegisterInfo();
                     regRsi.Register = "RSI";
                     regRsi.RegisterValue = (IntPtr)ThreadsInfo[i].Context64.Rsi;
                     regRsi.ThreadID = ThreadsInfo[i].ThreadID;
+                    regRsi.StringOffset = -1;
+                    regRsi.RegisterOffset = -1;
                     registers.Add(regRsi);
                     RegisterInfo regRdi = new RegisterInfo();
                     regRdi.Register = "RDI";
                     regRdi.RegisterValue = (IntPtr)ThreadsInfo[i].Context64.Rdi;
                     regRdi.ThreadID = ThreadsInfo[i].ThreadID;
+                    regRdi.StringOffset = -1;
+                    regRdi.RegisterOffset = -1;
                     registers.Add(regRdi);
                     RegisterInfo regR8 = new RegisterInfo();
                     regR8.Register = "R8";
                     regR8.RegisterValue = (IntPtr)ThreadsInfo[i].Context64.R8;
                     regR8.ThreadID = ThreadsInfo[i].ThreadID;
+                    regR8.StringOffset = -1;
+                    regR8.RegisterOffset = -1;
                     registers.Add(regR8);
                     RegisterInfo regR9 = new RegisterInfo();
                     regR9.Register = "R9";
                     regR9.RegisterValue = (IntPtr)ThreadsInfo[i].Context64.R9;
                     regR9.ThreadID = ThreadsInfo[i].ThreadID;
+                    regR9.StringOffset = -1;
+                    regR9.RegisterOffset = -1;
                     registers.Add(regR9);
                     RegisterInfo regR10 = new RegisterInfo();
                     regR10.Register = "R10";
                     regR10.RegisterValue = (IntPtr)ThreadsInfo[i].Context64.R10;
                     regR10.ThreadID = ThreadsInfo[i].ThreadID;
+                    regR10.StringOffset = -1;
+                    regR10.RegisterOffset = -1;
                     registers.Add(regR10);
                     RegisterInfo regR11 = new RegisterInfo();
                     regR11.Register = "R11";
                     regR11.RegisterValue = (IntPtr)ThreadsInfo[i].Context64.R11;
                     regR11.ThreadID = ThreadsInfo[i].ThreadID;
+                    regR11.StringOffset = -1;
+                    regR11.RegisterOffset = -1;
                     registers.Add(regR11);
                     RegisterInfo regR12 = new RegisterInfo();
                     regR12.Register = "R12";
                     regR12.RegisterValue = (IntPtr)ThreadsInfo[i].Context64.R12;
                     regR12.ThreadID = ThreadsInfo[i].ThreadID;
+                    regR12.StringOffset = -1;
+                    regR12.RegisterOffset = -1;
                     registers.Add(regR12);
                     RegisterInfo regR13 = new RegisterInfo();
                     regR13.Register = "R13";
                     regR13.RegisterValue = (IntPtr)ThreadsInfo[i].Context64.R13;
                     regR13.ThreadID = ThreadsInfo[i].ThreadID;
+                    regR13.StringOffset = -1;
+                    regR13.RegisterOffset = -1;
                     registers.Add(regR13);
                     RegisterInfo regR14 = new RegisterInfo();
                     regR14.Register = "R14";
                     regR14.RegisterValue = (IntPtr)ThreadsInfo[i].Context64.R14;
                     regR14.ThreadID = ThreadsInfo[i].ThreadID;
+                    regR14.StringOffset = -1;
+                    regR14.RegisterOffset = -1;
                     registers.Add(regR14);
                     RegisterInfo regR15 = new RegisterInfo();
                     regR15.Register = "R15";
                     regR15.RegisterValue = (IntPtr)ThreadsInfo[i].Context64.R15;
                     regR15.ThreadID = ThreadsInfo[i].ThreadID;
+                    regR15.StringOffset = -1;
+                    regR15.RegisterOffset = -1;
                     registers.Add(regR15);
                     RegisterInfo regRIP = new RegisterInfo();
                     regRIP.Register = "RIP";
@@ -1499,53 +1655,23 @@ namespace ERC
                             int length = 0;
                             for (int k = 0; k < nrps.Count; k++)
                             {
-                                if (memoryString.Contains(nrps[k]))
+                                if (memoryString.Contains(nrps[k]) && pattern.Contains(nrps[k]))
                                 {
-                                    if (length == 0)
+                                    if (registers[i].StringOffset == -1)
                                     {
                                         registers[i].StringOffset = pattern.IndexOf(nrps[k]);
-
-                                        //Check to see if previous characters match
-                                        int index = memoryString.IndexOf(nrps[k]);
-                                        registers[i].RegisterOffset = index;
-                                        if (index >= 2)
-                                        {
-                                            char pos3 = memoryString[index - 1];
-                                            char pos2 = memoryString[index - 2];
-                                            char pos1 = memoryString[index - 3];
-                                            if (k > 0 && nrps[k - 1][2] == pos3)
-                                            {
-                                                registers[i].StringOffset--;
-                                                registers[i].RegisterOffset--;
-                                                if (nrps[k - 1][1] == pos2)
-                                                {
-                                                    registers[i].StringOffset--;
-                                                    registers[i].RegisterOffset--;
-                                                    if (nrps[k - 1][0] == pos1)
-                                                    {
-                                                        registers[i].StringOffset--;
-                                                        registers[i].RegisterOffset--;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        else if (index == 1)
-                                        {
-                                            char pos3 = memoryString[index - 1];
-                                            if (nrps[k - 1][2] == pos3 && k > 0)
-                                            {
-                                                registers[i].RegisterOffset--;
-                                            }
-                                        }
                                     }
+
+                                    int index = memoryString.IndexOf(nrps[k]);
+                                    if (registers[i].RegisterOffset == -1)
+                                    {
+                                        registers[i].RegisterOffset = index;
+                                    }
+
                                     length += 3;
                                 }
-                                else
-                                {
-                                    k = nrps.Count;
-                                    registers[i].BufferSize = length;
-                                }
                             }
+                            registers[i].BufferSize = length;
                         }
                         else if(registers[i].Register != "RIP")
                         {
@@ -1580,6 +1706,19 @@ namespace ERC
                             if (pattern.Contains(RIPValue))
                             {
                                 registers[i].StringOffset = pattern.IndexOf(RIPValue);
+                            }
+                        }
+                    }
+                    if (Utilities.PatternTools.PatternOffset(Utilities.Convert.HexToAscii(registers[i].RegisterValue.ToString("X")), ProcessCore).ReturnValue != "Value not found in pattern.")
+                    {
+                        if (Utilities.Convert.HexToAscii(registers[i].RegisterValue.ToString("X")).Length > 0)
+                        {
+                            string regHex = Utilities.Convert.HexToAscii(registers[i].RegisterValue.ToString("X"));
+                            string regPos = Utilities.PatternTools.PatternOffset(Utilities.Convert.HexToAscii(registers[i].RegisterValue.ToString("X")), ProcessCore).ReturnValue;
+                            if (!String.IsNullOrEmpty(regPos) && regPos.Any(char.IsDigit))
+                            {
+                                registers[i].StringOffset = Int32.Parse(Regex.Match(regPos, @"\d+").Value);
+                                registers[i].overwritten = true;
                             }
                         }
                     }
@@ -1624,8 +1763,10 @@ namespace ERC
                                     char[] sehArray = SEHValue.ToCharArray();
                                     Array.Reverse(sehArray);
                                     SEHValue = new string(sehArray);
+                                    Array.Reverse(sehArray);
+                                    string ReversedSEHValue = new string(sehArray);
                                     RegisterInfo SEH = new RegisterInfo();
-                                    if (pattern.Contains(SEHValue))
+                                    if (pattern.Contains(SEHValue) || pattern.Contains(ReversedSEHValue)) ;
                                     {
                                         SEH.Register = "SEH" + i.ToString();
                                         SEH.StringOffset = pattern.IndexOf(SEHValue);
@@ -1747,6 +1888,46 @@ namespace ERC
 
         #endregion
 
+        #region CreateExcludesList
+        /// <summary>
+        /// Creates a list of modules to exclude from a search of memory.
+        /// </summary>
+        /// <returns>Returns an ErcResult containing a list of stringss</returns>
+        public List<string> CreateExcludesList(bool aslr = false, bool safeseh = false, bool rebase = false, bool nxcompat = false, bool osdll = false)
+        {
+            List<string> excludedModules = new List<string>();
+            for(int i = 0; i < ModulesInfo.Count; i++)
+            {
+                bool add = false;
+                if(aslr == true && ModulesInfo[i].ModuleASLR == true)
+                {
+                    add = true;
+                }
+                if (safeseh == true && ModulesInfo[i].ModuleSafeSEH == true)
+                {
+                    add = true;
+                }
+                if (rebase == true && ModulesInfo[i].ModuleRebase == true)
+                {
+                    add = true;
+                }
+                if (nxcompat == true && ModulesInfo[i].ModuleNXCompat == true)
+                {
+                    add = true;
+                }
+                if (osdll == true && ModulesInfo[i].ModuleOsDll == true)
+                {
+                    add = true;
+                }
+                if(add == true)
+                {
+                    excludedModules.Add(ModulesInfo[i].ModulePath);
+                }
+            }
+            return excludedModules;
+        }
+        #endregion
+
         #region Accessors
 
         #region ToString
@@ -1763,11 +1944,11 @@ namespace ERC
             ret += "Process ID = " + ProcessID + Environment.NewLine;
             if(ProcessMachineType == MachineType.I386)
             {
-                ret += "Process Handle = 0x" + ProcessHandle.ToString("X8");
+                ret += "Process Handle = 0x" + ProcessHandle.ToString("X8") + Environment.NewLine;
             }
             else
             {
-                ret += "Process Handle = 0x" + ProcessHandle.ToString("X16");
+                ret += "Process Handle = 0x" + ProcessHandle.ToString("X16") + Environment.NewLine;
             }
             ret += "Process Machine Type = " + ProcessMachineType.ToString() + Environment.NewLine;
 
@@ -1835,6 +2016,40 @@ namespace ERC
                 ret.Error = new ERCException("Error: An unknown eroor has occured whilst populating the threads list for this process. Check the error log for more detailed information.");
                 return ret;
             }
+        }
+        #endregion
+
+        #region Dump Memory Region
+        /// <summary>
+        /// Reads process memory from a specific address for a set number of bytes. 
+        /// </summary>
+        /// <param name="startAddress">The address to start reading from.</param>
+        /// <param name="length">Number of bytes to read.</param>
+        /// <returns>Returns a bytes array containing the specified contents of process memory.</returns>
+        public ErcResult<byte[]> DumpMemoryRegion(IntPtr startAddress, int length)
+        {
+            ErcResult<byte[]> result = new ErcResult<byte[]>(ProcessCore);
+            byte[] bytes = new byte[length];
+            try
+            {
+                int retValue = ErcCore.ReadProcessMemory(ProcessHandle, startAddress, bytes, length, out int bytesRead);
+                if (retValue == 0)
+                {
+                    ERCException ex = new ERCException(new Win32Exception(Marshal.GetLastWin32Error()).Message);
+                    result.ReturnValue = bytes;
+                    throw ex;
+                }
+                else
+                {
+                    result.ReturnValue = bytes;
+                }
+            }
+            catch(Exception e)
+            {
+                result.Error = e;
+            }
+            
+            return result;
         }
         #endregion
 
